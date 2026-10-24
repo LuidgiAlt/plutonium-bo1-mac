@@ -1,0 +1,36 @@
+Subject: wined3d: select the vertex shader again when the pixel shader changes
+Date: 2026-10-15
+Applies to: CrossOver 26.3.0 Wine sources, after 0013
+Files changed: dlls/wined3d/context_vk.c
+
+For shader model 1-3, the vertex shader is compiled with a varying map built
+from the pixel shader's inputs, which decides where each output is written.
+The Vulkan backend only selected the vertex shader variant again when the
+vertex shader or the vertex declaration changed, so after a pixel shader
+change it kept writing to the previous pixel shader's inputs. The pixel shader
+then read the wrong values, or inputs no vertex output wrote, which Metal
+rejects ("Fragment input(s) ... not written by vertex shader"); each rejected
+pipeline is a stall in BO1. A pixel shader change now selects the vertex
+shader variant again.
+
+Test: tools/d3d9-varying-test.c
+License: LGPL-2.1-or-later, like the Wine files it modifies.
+---
+--- a/dlls/wined3d/context_vk.c
++++ b/dlls/wined3d/context_vk.c
+@@ -4053,9 +4053,13 @@
+         context_vk->c.shader_update_mask |= (1u << WINED3D_SHADER_TYPE_PIXEL);
+         context_vk->c.last_was_dual_source_blend = dual_source_blend;
+     }
+-    /* The vertex declaration selects which shader inputs are integers. */
++    /* The vertex declaration selects which shader inputs are integers, and
++     * for shader model 1-3 the pixel shader's inputs select where the vertex
++     * shader writes its outputs (the varying map), so a new pixel shader needs
++     * the matching vertex shader variant. */
+     if (wined3d_context_is_graphics_state_dirty(&context_vk->c, STATE_SHADER(WINED3D_SHADER_TYPE_VERTEX))
+-            || wined3d_context_is_graphics_state_dirty(&context_vk->c, STATE_VDECL))
++            || wined3d_context_is_graphics_state_dirty(&context_vk->c, STATE_VDECL)
++            || wined3d_context_is_graphics_state_dirty(&context_vk->c, STATE_SHADER(WINED3D_SHADER_TYPE_PIXEL)))
+         context_vk->c.shader_update_mask |= (1u << WINED3D_SHADER_TYPE_VERTEX);
+     if (wined3d_context_is_graphics_state_dirty(&context_vk->c, STATE_SHADER(WINED3D_SHADER_TYPE_GEOMETRY)))
+         context_vk->c.shader_update_mask |= (1u << WINED3D_SHADER_TYPE_GEOMETRY);

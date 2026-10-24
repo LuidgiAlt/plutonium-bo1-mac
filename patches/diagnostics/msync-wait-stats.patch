@@ -1,0 +1,175 @@
+Diagnostic only: WINE_MSYNC_STATS=1 logs once per second how many waits block
+directly in the kernel and how many go through wineserver (multi-object and
+alertable waits), their time, and signals that notify wineserver.
+Also counts PulseEvent calls, those that woke a thread, and the time spent
+in their sched_yield(). Applies after 0015. Build it into a separate
+ntdll.so, install that in the runner in place of the normal one, and run with
+SYNCSTATS=1.
+
+--- a/dlls/ntdll/unix/msync.c
++++ b/dlls/ntdll/unix/msync.c
+@@ -211,6 +211,69 @@
+ 
+ static mach_port_t server_port;
+ 
++/* Diagnostic (WINE_MSYNC_STATS=1): once per second, how many waits blocked
++ * directly in the kernel (single), how many went through wineserver
++ * (multiple: register, spin, block, unregister), how long they blocked, how
++ * often the register spin looped, and how many signals had to notify
++ * wineserver. Uses only write(2). */
++#include <mach/mach_time.h>
++static int msync_stats = -1;
++static volatile long ms_single, ms_multi, ms_spin, ms_signal_server, ms_calls, ms_pulse, ms_pulse_woke;
++static volatile unsigned long long ms_yield_ns, ms_yield_max_ns;
++static volatile unsigned long long ms_single_ns, ms_multi_ns, ms_multi_max_ns, ms_last_ns;
++
++static unsigned long long ms_now(void)
++{
++    static mach_timebase_info_data_t tb;
++    if (!tb.denom) mach_timebase_info( &tb );
++    return mach_absolute_time() * tb.numer / tb.denom;
++}
++
++static char *ms_utoa( char *p, unsigned long long v )
++{
++    char tmp[24]; int n = 0;
++    do tmp[n++] = '0' + v % 10; while ((v /= 10));
++    while (n) *p++ = tmp[--n];
++    return p;
++}
++
++static char *ms_str( char *p, const char *s )
++{
++    while (*s) *p++ = *s++;
++    return p;
++}
++
++static void ms_report(void)
++{
++    unsigned long long now = ms_now(), last = ms_last_ns;
++    char buf[256], *p = buf;
++
++    if (now - last < 1000000000ull) return;
++    if (!__sync_bool_compare_and_swap( &ms_last_ns, last, now )) return;
++    p = ms_str( p, "msync-stats: calls " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_calls, 0 ) );
++    p = ms_str( p, ", kernel waits " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_single, 0 ) );
++    p = ms_str( p, " (" ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_single_ns, 0 ) / 1000000 );
++    p = ms_str( p, " ms), server waits " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_multi, 0 ) );
++    p = ms_str( p, " (" ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_multi_ns, 0 ) / 1000000 );
++    p = ms_str( p, " ms, longest " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_multi_max_ns, 0 ) / 1000 );
++    p = ms_str( p, " us), register spins " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_spin, 0 ) );
++    p = ms_str( p, ", signals via server " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_signal_server, 0 ) );
++    p = ms_str( p, ", pulses " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_pulse, 0 ) );
++    p = ms_str( p, " (with waiters " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_pulse_woke, 0 ) );
++    p = ms_str( p, ", yield " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_yield_ns, 0 ) / 1000 );
++    p = ms_str( p, " us, longest " ); p = ms_utoa( p, __sync_lock_test_and_set( &ms_yield_max_ns, 0 ) / 1000 );
++    p = ms_str( p, " us)" );
++    p = ms_str( p, " ms-time " ); p = ms_utoa( p, now / 1000000 );
++    *p++ = '\n';
++    write( 2, buf, p - buf );
++}
++
++static inline int ms_on(void)
++{
++    if (msync_stats < 0) msync_stats = getenv( "WINE_MSYNC_STATS" ) && atoi( getenv( "WINE_MSYNC_STATS" ) );
++    return msync_stats;
++}
++
+ static int *shm_tid_map;
+ 
+ static const mach_msg_bits_t msgh_bits_send = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
+@@ -321,7 +384,15 @@
+             ns_timeleft = update_timeout( *end ) * 100;
+             if (!ns_timeleft) return STATUS_TIMEOUT;
+         }
+-        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
++        if (ms_on())
++        {
++            unsigned long long t0 = ms_now();
++            ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
++            __sync_fetch_and_add( &ms_single, 1 );
++            __sync_fetch_and_add( &ms_single_ns, ms_now() - t0 );
++        }
++        else
++            ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
+     } while (ret == -EINTR || ret == -EFAULT);
+ 
+     if (ret == -ETIMEDOUT)
+@@ -365,6 +436,8 @@
+     mach_msg_return_t mr;
+     unsigned int msgh_id;
+     int total_count = count + (alert_obj ? 1 : 0);
++    unsigned long long ms_t0 = ms_on() ? ms_now() : 0;
++    NTSTATUS ms_status;
+ 
+     __atomic_store_n( addr, 2, __ATOMIC_RELEASE );
+     msgh_id = (tid << 8) | total_count;
+@@ -375,6 +448,7 @@
+ 
+     while (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) == 2)
+     {
++        if (ms_t0) __sync_fetch_and_add( &ms_spin, 1 );
+         if (check_shm_contention( objs_shm, alert_obj_shm, count, tid ))
+         {
+             int i;
+@@ -409,9 +483,15 @@
+ 
+     server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+ 
+-    if (ret == -ETIMEDOUT) return STATUS_TIMEOUT;
+-
+-    return STATUS_SUCCESS;
++    ms_status = ret == -ETIMEDOUT ? STATUS_TIMEOUT : STATUS_SUCCESS;
++    if (ms_t0)
++    {
++        unsigned long long d = ms_now() - ms_t0;
++        __sync_fetch_and_add( &ms_multi, 1 );
++        __sync_fetch_and_add( &ms_multi_ns, d );
++        if (d > ms_multi_max_ns) ms_multi_max_ns = d;
++    }
++    return ms_status;
+ }
+ 
+ int do_msync(void)
+@@ -658,6 +738,7 @@
+ 
+     if (!__atomic_load_n( &event_obj->multiple_waiters, __ATOMIC_SEQ_CST ))
+         return woke;
++    if (ms_on()) __sync_fetch_and_add( &ms_signal_server, 1 );
+ 
+     send_header.msgh_bits = msgh_bits_send;
+     send_header.msgh_id = shm_idx;
+@@ -738,7 +819,20 @@
+     /* Try to give woken threads a chance to see the event before it is reset.
+      * Only when there are some: sched_yield() can cost the caller its time
+      * slice on macOS, and BO1 pulses events from its main thread. */
+-    if (woke) sched_yield();
++    if (ms_on())
++    {
++        __sync_fetch_and_add( &ms_pulse, 1 );
++        if (woke)
++        {
++            unsigned long long t0 = ms_now(), d;
++            sched_yield();
++            d = ms_now() - t0;
++            __sync_fetch_and_add( &ms_pulse_woke, 1 );
++            __sync_fetch_and_add( &ms_yield_ns, d );
++            if (d > ms_yield_max_ns) ms_yield_max_ns = d;
++        }
++    }
++    else if (woke) sched_yield();
+ 
+     __atomic_store_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
+ 
+@@ -821,6 +915,11 @@
+     int i, ret;
+ 
+     current_tid = GetCurrentThreadId();
++    if (ms_on())
++    {
++        __sync_fetch_and_add( &ms_calls, 1 );
++        ms_report();
++    }
+ 
+     if (alert_obj)
+     {

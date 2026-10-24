@@ -1,0 +1,575 @@
+Diagnostic only. Measures where the thread that presents (the game's thread)
+spends its time in Direct3D, with WINE_LOG=1 ("d3d-time" lines in wine.log):
+- once per second: frames, calls, draws, the time inside Direct3D calls
+  (outermost wined3d_mutex_lock to unlock, without waiting for the render
+  thread), in wined3d_device_apply_stateblock(), waiting for command queue
+  space, waiting for the queue to drain, and waiting at Present;
+- every 5 s: the 15 callers of the lock with the most time (module+offset;
+  resolve d3d9.dll offsets with addr2line on an unstripped d3d9.dll built from
+  the same sources, image base 0x10000000), the time of each section of
+  apply_stateblock and of each fixed-function branch with how often it ran,
+  and push constant uploads by type;
+- the steps of d3d9's DrawIndexedPrimitive, reported from
+  IDirect3DDevice9::Present only, so not for games that present through the
+  swapchain, as BO1 does.
+Applies after 0019. Build wined3d.dll and d3d9.dll with it, install the
+wined3d.dll in the runner and the d3d9.dll as d3d9.dll.orig (run.sh puts that
+one in place at each start), and run with WINE_LOG=1.
+
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -3680,6 +3680,43 @@
+ 
+ C_ASSERT(!(WINED3D_CS_QUEUE_SIZE & (WINED3D_CS_QUEUE_SIZE - 1)));
+ 
++/* Diagnostic (d3d time): counters in rdtsc ticks, reported once per second
++ * from the presenting thread. */
++struct wined3d_dt
++{
++    DWORD thread;
++    unsigned int depth;
++    unsigned long long inside_start;
++    LONG64 inside, apply, space, finish, present_wait;
++    LONG calls, draws, frames;
++    void *caller;
++    struct { void *caller; LONG64 ticks; LONG count; } by_caller[128];
++    LONG64 sec[9];
++    LONG64 ffp[12];
++    LONG ffp_n[12];
++    unsigned long long ffp_t;
++    int ffp_k;
++    LONG push[8], push_same, ops;
++    LONG64 push_bytes;
++};
++/* Fixed-function segments of apply_stateblock: time from marker k to the
++ * next one, and how often branch k's condition was true. */
++#define WINED3D_DT_FFP(k, cond) do { unsigned long long t_ = wined3d_dt_now(); \
++        if (wined3d_dt.thread == GetCurrentThreadId()) { \
++            if ((k) > 0) wined3d_dt.ffp[(k) - 1] += t_ - wined3d_dt.ffp_t; \
++            if (cond) ++wined3d_dt.ffp_n[k]; } \
++        wined3d_dt.ffp_t = t_; } while (0)
++#define WINED3D_DT_SEC(n) do { unsigned long long t_ = wined3d_dt_now(); \
++        if (wined3d_dt.thread == GetCurrentThreadId()) wined3d_dt.sec[n] += t_ - dt_t; dt_t = t_; } while (0)
++extern struct wined3d_dt wined3d_dt;
++static inline unsigned long long wined3d_dt_now(void)
++{
++    unsigned int lo, hi;
++    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
++    return ((unsigned long long)hi << 32) | lo;
++}
++void wined3d_dt_report(void);
++
+ struct wined3d_cs_queue
+ {
+     ULONG head, tail;
+--- a/dlls/wined3d/wined3d_main.c
++++ b/dlls/wined3d/wined3d_main.c
+@@ -557,15 +557,135 @@
+     DeleteCriticalSection(&wined3d_cs);
+     return TRUE;
+ }
++
++struct wined3d_dt wined3d_dt;
+ 
++/* Time between the outermost lock and unlock on the presenting thread: the
++ * time that thread spends inside Direct3D calls. */
+ void WINAPI wined3d_mutex_lock(void)
+ {
+     EnterCriticalSection(&wined3d_cs);
++    if (wined3d_dt.thread == GetCurrentThreadId() && !wined3d_dt.depth++)
++    {
++        wined3d_dt.inside_start = wined3d_dt_now();
++        wined3d_dt.caller = __builtin_return_address(0);
++        ++wined3d_dt.calls;
++    }
+ }
+ 
+ void WINAPI wined3d_mutex_unlock(void)
+ {
++    if (wined3d_dt.thread == GetCurrentThreadId() && wined3d_dt.depth && !--wined3d_dt.depth)
++    {
++        unsigned long long d = wined3d_dt_now() - wined3d_dt.inside_start;
++        unsigned int i = ((ULONG_PTR)wined3d_dt.caller >> 2) % ARRAY_SIZE(wined3d_dt.by_caller), n;
++
++        wined3d_dt.inside += d;
++        for (n = 0; n < ARRAY_SIZE(wined3d_dt.by_caller); ++n, i = (i + 1) % ARRAY_SIZE(wined3d_dt.by_caller))
++        {
++            if (wined3d_dt.by_caller[i].caller != wined3d_dt.caller && wined3d_dt.by_caller[i].caller)
++                continue;
++            wined3d_dt.by_caller[i].caller = wined3d_dt.caller;
++            wined3d_dt.by_caller[i].ticks += d;
++            ++wined3d_dt.by_caller[i].count;
++            break;
++        }
++    }
+     LeaveCriticalSection(&wined3d_cs);
++}
++
++void wined3d_dt_report(void)
++{
++    static LARGE_INTEGER last_qpc, freq;
++    static unsigned long long last_tsc;
++    unsigned long long tsc = wined3d_dt_now();
++    LARGE_INTEGER qpc;
++    double tick_ms;
++
++    if (wined3d_dt.thread != GetCurrentThreadId())
++    {
++        wined3d_dt.thread = GetCurrentThreadId();
++        wined3d_dt.depth = 1; /* called with the lock held */
++        wined3d_dt.inside_start = tsc;
++    }
++    ++wined3d_dt.frames;
++    QueryPerformanceCounter(&qpc);
++    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
++    if (!last_qpc.QuadPart) { last_qpc = qpc; last_tsc = tsc; return; }
++    if (qpc.QuadPart - last_qpc.QuadPart < freq.QuadPart) return;
++    tick_ms = (double)(qpc.QuadPart - last_qpc.QuadPart) * 1000.0 / freq.QuadPart / (double)(tsc - last_tsc);
++    ERR("d3d-time: %.2f s, frames %ld, calls %ld, draws %ld, inside d3d %.0f ms, apply_stateblock %.0f ms, "
++            "queue full %.0f ms, finish %.0f ms, present wait %.0f ms\n",
++            (double)(qpc.QuadPart - last_qpc.QuadPart) / freq.QuadPart, wined3d_dt.frames, wined3d_dt.calls,
++            wined3d_dt.draws, wined3d_dt.inside * tick_ms, wined3d_dt.apply * tick_ms, wined3d_dt.space * tick_ms,
++            wined3d_dt.finish * tick_ms, wined3d_dt.present_wait * tick_ms);
++    /* Every 5 s: the 15 callers (module + offset) with the most time inside. */
++    {
++        static unsigned int reports;
++        unsigned int i, j, best;
++
++        if (!(++reports % 5))
++        {
++            ERR("d3d-time apply sections (ms / 5 s): clear-state %.0f, constants %.0f, render states %.0f, "
++                    "blend/depth %.0f, texture/sampler states %.0f, bindings %.0f, ffp state %.0f, shaders %.0f, "
++                    "end %.0f\n", wined3d_dt.sec[0] * tick_ms, wined3d_dt.sec[1] * tick_ms, wined3d_dt.sec[2] * tick_ms,
++                    wined3d_dt.sec[3] * tick_ms, wined3d_dt.sec[4] * tick_ms, wined3d_dt.sec[5] * tick_ms,
++                    wined3d_dt.sec[6] * tick_ms, wined3d_dt.sec[7] * tick_ms, wined3d_dt.sec[8] * tick_ms);
++            ERR("d3d-time push constants / 5 s: vs_f %ld, ps_f %ld, vs_i %ld, ps_i %ld, vs_b %ld, ps_b %ld, "
++                    "vs_ffp %ld, ps_ffp %ld, unchanged %ld, %.1f MB; queued ops %ld\n",
++                    wined3d_dt.push[0], wined3d_dt.push[1], wined3d_dt.push[2], wined3d_dt.push[3],
++                    wined3d_dt.push[4], wined3d_dt.push[5], wined3d_dt.push[6], wined3d_dt.push[7],
++                    wined3d_dt.push_same, wined3d_dt.push_bytes / 1e6, wined3d_dt.ops);
++            {
++                static const char * const names[] = {"material", "lights", "modelview", "texture matrices",
++                        "point scale", "point size", "bumpenv", "ffp ps constants", "extra vs args", "alpha ref",
++                        "fog"};
++                char buf[512];
++                int len = 0;
++
++                for (i = 0; i < ARRAY_SIZE(names); ++i)
++                    len += snprintf(buf + len, sizeof(buf) - len, "%s %.0f ms/%ld, ", names[i],
++                            wined3d_dt.ffp[i] * tick_ms, wined3d_dt.ffp_n[i]);
++                ERR("d3d-time ffp branches (ms/count per 5 s): %s\n", buf);
++                memset(wined3d_dt.ffp, 0, sizeof(wined3d_dt.ffp));
++                memset(wined3d_dt.ffp_n, 0, sizeof(wined3d_dt.ffp_n));
++            }
++            memset(wined3d_dt.sec, 0, sizeof(wined3d_dt.sec));
++            memset(wined3d_dt.push, 0, sizeof(wined3d_dt.push));
++            wined3d_dt.push_same = wined3d_dt.ops = 0;
++            wined3d_dt.push_bytes = 0;
++            for (j = 0; j < 15; ++j)
++            {
++                HMODULE module = NULL;
++                WCHAR name[MAX_PATH] = L"?", *p;
++
++                best = ~0u;
++                for (i = 0; i < ARRAY_SIZE(wined3d_dt.by_caller); ++i)
++                    if (wined3d_dt.by_caller[i].count >= 0 && wined3d_dt.by_caller[i].ticks
++                            && (best == ~0u || wined3d_dt.by_caller[i].ticks > wined3d_dt.by_caller[best].ticks))
++                        best = i;
++                if (best == ~0u) break;
++                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                        wined3d_dt.by_caller[best].caller, &module);
++                if (module) GetModuleFileNameW(module, name, ARRAY_SIZE(name));
++                p = wcsrchr(name, '\\') ? wcsrchr(name, '\\') + 1 : name;
++                ERR("d3d-time caller: %s+%#Ix %.0f ms / 5 s, %ld calls\n", debugstr_w(p),
++                        (ULONG_PTR)wined3d_dt.by_caller[best].caller - (ULONG_PTR)module,
++                        wined3d_dt.by_caller[best].ticks * tick_ms, wined3d_dt.by_caller[best].count);
++                wined3d_dt.by_caller[best].ticks = 0;
++                wined3d_dt.by_caller[best].count = -1; /* printed */
++            }
++            for (i = 0; i < ARRAY_SIZE(wined3d_dt.by_caller); ++i)
++            {
++                wined3d_dt.by_caller[i].ticks = 0;
++                wined3d_dt.by_caller[i].count = 0;
++            }
++        }
++    }
++    wined3d_dt.frames = wined3d_dt.calls = wined3d_dt.draws = 0;
++    wined3d_dt.inside = wined3d_dt.apply = wined3d_dt.space = wined3d_dt.finish = wined3d_dt.present_wait = 0;
++    last_qpc = qpc;
++    last_tsc = tsc;
+ }
+ 
+ static void wined3d_wndproc_mutex_lock(void)
+--- a/dlls/wined3d/stateblock.c
++++ b/dlls/wined3d/stateblock.c
+@@ -3110,8 +3110,21 @@
+     state.size = device->push_constants[type]->resource.size,
+     wined3d_device_context_set_constant_buffers(&device->cs->c, shader_type, shader_binding, 1, &state);
+ }
++
++static void wined3d_device_apply_stateblock_impl(struct wined3d_device *device,
++        struct wined3d_stateblock *stateblock);
+ 
+ void CDECL wined3d_device_apply_stateblock(struct wined3d_device *device,
++        struct wined3d_stateblock *stateblock)
++{
++    unsigned long long t0 = wined3d_dt_now();
++
++    wined3d_device_apply_stateblock_impl(device, stateblock);
++    if (wined3d_dt.thread == GetCurrentThreadId())
++        wined3d_dt.apply += wined3d_dt_now() - t0;
++}
++
++static void wined3d_device_apply_stateblock_impl(struct wined3d_device *device,
+         struct wined3d_stateblock *stateblock)
+ {
+     bool set_blend_state = false, set_depth_stencil_state = false;
+@@ -3124,11 +3137,13 @@
+     bool set_depth_bounds = false;
+     struct wined3d_range range;
+     uint32_t map;
++    unsigned long long dt_t = wined3d_dt_now();
+ 
+     TRACE("device %p, stateblock %p.\n", device, stateblock);
+ 
+     wined3d_stateblock_apply_clear_state(stateblock, device);
+ 
++    WINED3D_DT_SEC(0);
+     if (changed->vertexShader)
+     {
+         /* Clip planes are affected by the view matrix, but only if not using
+@@ -3189,6 +3204,7 @@
+         wined3d_device_set_ps_consts_b(device, range.offset, range.size, &state->ps_consts_b[range.offset]);
+     }
+ 
++    WINED3D_DT_SEC(1);
+     for (i = 0; i < ARRAY_SIZE(changed->renderState); ++i)
+     {
+         map = changed->renderState[i];
+@@ -3476,6 +3492,7 @@
+         }
+     }
+ 
++    WINED3D_DT_SEC(2);
+     if (set_blend_state || changed->alpha_to_coverage
+             || wined3d_bitmap_is_set(changed->renderState, WINED3D_RS_ADAPTIVETESS_Y))
+     {
+@@ -3626,6 +3643,7 @@
+                 int_to_float(state->rs[WINED3D_RS_ADAPTIVETESS_W]));
+     }
+ 
++    WINED3D_DT_SEC(3);
+     for (i = 0; i < ARRAY_SIZE(changed->textureState); ++i)
+     {
+         map = changed->textureState[i];
+@@ -3724,6 +3742,7 @@
+         cache->sampler = sampler;
+     }
+ 
++    WINED3D_DT_SEC(4);
+     if (state->vertex_declaration && state->vertex_declaration->position_transformed)
+     {
+         /* We reuse the projection matrix to undo the translation between
+@@ -3842,10 +3861,13 @@
+                 offsetof(struct wined3d_ffp_vs_constants, clip_planes[i]), sizeof(plane), &plane);
+     }
+ 
++    WINED3D_DT_SEC(5);
++    WINED3D_DT_FFP(0, changed->material);
+     if (changed->material)
+         wined3d_device_context_push_constants(context, WINED3D_PUSH_CONSTANTS_VS_FFP, WINED3D_SHADER_CONST_FFP_MATERIAL,
+                 offsetof(struct wined3d_ffp_vs_constants, material), sizeof(state->material), &state->material);
+ 
++    WINED3D_DT_FFP(1, changed->lights);
+     if (changed->lights)
+     {
+         unsigned int point_idx, spot_idx, directional_idx, parallel_point_idx;
+@@ -3935,6 +3957,7 @@
+                 offsetof(struct wined3d_ffp_vs_constants, light), sizeof(constants), &constants);
+     }
+ 
++    WINED3D_DT_FFP(2, changed->modelview_matrices);
+     if (changed->modelview_matrices)
+     {
+         union wined3d_ffp_vs_modelview_matrices matrices;
+@@ -3962,6 +3985,7 @@
+         }
+     }
+ 
++    WINED3D_DT_FFP(3, changed->texture_matrices);
+     /* Texture matrices feed only the fixed-function vertex pipeline, but they
+      * are marked changed with every vertex declaration change, which games
+      * can do thousands of times per second with a vertex shader bound. While
+@@ -3985,6 +4009,7 @@
+                 sizeof(constants.texture_matrices), constants.texture_matrices);
+     }
+ 
++    WINED3D_DT_FFP(4, changed->point_scale);
+     if (changed->point_scale)
+     {
+         struct wined3d_ffp_point_constants constants;
+@@ -4010,6 +4035,7 @@
+                 offsetof(struct wined3d_ffp_vs_constants, point), sizeof(constants), &constants);
+     }
+ 
++    WINED3D_DT_FFP(5, (wined3d_bitmap_is_set(changed->renderState, WINED3D_RS_POINTSIZE_MIN) || wined3d_bitmap_is_set(changed->renderState, WINED3D_RS_POINTSIZE_MAX)));
+     if (wined3d_bitmap_is_set(changed->renderState, WINED3D_RS_POINTSIZE_MIN)
+             || wined3d_bitmap_is_set(changed->renderState, WINED3D_RS_POINTSIZE_MAX))
+     {
+@@ -4023,6 +4049,7 @@
+                 offsetof(struct wined3d_ffp_vs_constants, point_clamp), sizeof(constants), &constants);
+     }
+ 
++    WINED3D_DT_FFP(6, changed->bumpenv_constants);
+     if (changed->bumpenv_constants)
+     {
+         struct wined3d_ffp_bumpenv_constants constants;
+@@ -4041,6 +4068,7 @@
+                 offsetof(struct wined3d_ffp_ps_constants, bumpenv), sizeof(constants), &constants);
+     }
+ 
++    WINED3D_DT_FFP(7, changed->ffp_ps_constants);
+     if (changed->ffp_ps_constants)
+     {
+         static const struct wined3d_color specular_enabled = {1.0f, 1.0f, 1.0f, 0.0f};
+@@ -4058,6 +4086,7 @@
+                 WINED3D_SHADER_CONST_FFP_PS, 0, offsetof(struct wined3d_ffp_ps_constants, color_key), &constants);
+     }
+ 
++    WINED3D_DT_FFP(8, changed->extra_vs_args);
+     if (changed->extra_vs_args)
+     {
+         const struct wined3d_matrix *proj = &state->transforms[WINED3D_TS_PROJECTION];
+@@ -4070,6 +4099,7 @@
+         wined3d_device_context_emit_set_extra_vs_args(context, &args);
+     }
+ 
++    WINED3D_DT_FFP(9, wined3d_bitmap_is_set(changed->renderState, WINED3D_RS_ALPHAREF));
+     if (wined3d_bitmap_is_set(changed->renderState, WINED3D_RS_ALPHAREF))
+     {
+         float f = (state->rs[WINED3D_RS_ALPHAREF] & 0xff) / 255.0f;
+@@ -4079,6 +4109,7 @@
+                 offsetof(struct wined3d_ffp_ps_constants, alpha_test_ref), sizeof(f), &f);
+     }
+ 
++    WINED3D_DT_FFP(10, (changed->fog_constants || changed->position_transformed));
+     if (changed->fog_constants || changed->position_transformed)
+     {
+         bool rhw = state->vertex_declaration && state->vertex_declaration->position_transformed;
+@@ -4119,6 +4150,8 @@
+                 offsetof(struct wined3d_ffp_ps_constants, fog), sizeof(fog), &fog);
+     }
+ 
++    WINED3D_DT_FFP(11, 0);
++    WINED3D_DT_SEC(6);
+     if (changed->vertexShader)
+     {
+         wined3d_device_context_set_shader(context, WINED3D_SHADER_TYPE_VERTEX, state->vs);
+@@ -4180,6 +4213,7 @@
+         }
+     }
+ 
++    WINED3D_DT_SEC(7);
+     bind_push_constant_buffer(device, WINED3D_PUSH_CONSTANTS_PS_FFP,
+             WINED3D_SHADER_TYPE_PIXEL, WINED3D_FFP_CONSTANTS_EXTRA_REGISTER);
+     bind_push_constant_buffer(device, WINED3D_PUSH_CONSTANTS_VS_FFP,
+@@ -4189,6 +4223,7 @@
+     memset(&stateblock->changed, 0, sizeof(stateblock->changed));
+     list_init(&stateblock->changed.changed_lights);
+ 
++    WINED3D_DT_SEC(8);
+     TRACE("Applied stateblock %p.\n", stateblock);
+ }
+ 
+--- a/dlls/wined3d/cs.c
++++ b/dlls/wined3d/cs.c
+@@ -768,6 +768,7 @@
+     LONG pending;
+ 
+     wined3d_not_from_cs(cs);
++    wined3d_dt_report();
+ 
+     op = wined3d_device_context_require_space(&cs->c, sizeof(*op), WINED3D_CS_QUEUE_DEFAULT);
+     op->opcode = WINED3D_CS_OP_PRESENT;
+@@ -798,8 +799,16 @@
+         if (pending >= swapchain->max_frame_latency || !InterlockedCompareExchange(&cs->waiting_for_present, FALSE, TRUE))
+         {
+             TRACE_(d3d_perf)("Reached latency limit (%u frames), blocking to wait.\n", swapchain->max_frame_latency);
++            unsigned long long dt_t0;
++
+             wined3d_mutex_unlock();
++            dt_t0 = wined3d_dt_now();
+             WaitForSingleObject(cs->present_event, INFINITE);
++            dt_t0 = wined3d_dt_now() - dt_t0;
++            wined3d_dt.present_wait += dt_t0;
++            /* Present holds the lock recursively: keep the wait out of the
++             * time inside Direct3D. */
++            if (wined3d_dt.depth) wined3d_dt.inside_start += dt_t0;
+             wined3d_mutex_lock();
+             TRACE_(d3d_perf)("Woken up from the wait.\n");
+         }
+@@ -1183,6 +1192,7 @@
+         bool indexed)
+ {
+     const struct wined3d_d3d_info *d3d_info = &context->device->adapter->d3d_info;
++    ++wined3d_dt.draws;
+     struct wined3d_cs_draw *op;
+ 
+     op = wined3d_device_context_require_space(context, sizeof(*op), WINED3D_CS_QUEUE_DEFAULT);
+@@ -2318,7 +2328,11 @@
+ 
+         /* Games often set the same values again before each draw. */
+         if (data[resource->size] && !memcmp(data + byte_offset, constants, byte_size))
++        {
++            ++wined3d_dt.push_same;
+             return;
++        }
++        ++wined3d_dt.push[type];
+ 
+         memcpy(data + byte_offset, constants, byte_size);
+         /* Send only the changed bytes; the command thread keeps a copy of
+@@ -2330,6 +2344,7 @@
+             byte_offset = 0;
+             byte_size = resource->size;
+         }
++        wined3d_dt.push_bytes += byte_size;
+         wined3d_device_context_emit_push_constants_data(context, type, update_mask, start_idx, count,
+                 context->device->push_constants[type], byte_offset, byte_size, data + byte_offset);
+         return;
+@@ -3454,7 +3469,10 @@
+         head = queue->head & WINED3D_CS_QUEUE_MASK;
+         assert(!head);
+     }
++
++    unsigned long long dt_t0 = wined3d_dt_now();
+ 
++    ++wined3d_dt.ops;
+     for (;;)
+     {
+         ULONG tail = (*(volatile ULONG *)&queue->tail) & WINED3D_CS_QUEUE_MASK;
+@@ -3476,6 +3494,9 @@
+         TRACE_(d3d_perf)("Waiting for free space. Head %lu, tail %lu, packet size %Iu.\n",
+                 head, tail, packet_size);
+     }
++
++    if (wined3d_dt.thread == GetCurrentThreadId())
++        wined3d_dt.space += wined3d_dt_now() - dt_t0;
+ 
+     packet = (struct wined3d_cs_packet *)&queue->data[head];
+     packet->size = size;
+@@ -3501,9 +3522,13 @@
+     if (cs->thread_id == GetCurrentThreadId())
+         return wined3d_cs_st_finish(context, queue_id);
+ 
++    unsigned long long dt_t0 = wined3d_dt_now();
++
+     TRACE_(d3d_perf)("Waiting for queue %u to be empty.\n", queue_id);
+     while (cs->queue[queue_id].head != *(volatile ULONG *)&cs->queue[queue_id].tail)
+         wined3d_pause(&spin_count);
++    if (wined3d_dt.thread == GetCurrentThreadId())
++        wined3d_dt.finish += wined3d_dt_now() - dt_t0;
+     TRACE_(d3d_perf)("Queue is now empty.\n");
+ }
+ 
+--- a/dlls/d3d9/device.c
++++ b/dlls/d3d9/device.c
+@@ -23,6 +23,48 @@
+ #include "d3d9_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d3d9);
++
++/* Diagnostic: time of each step of DrawIndexedPrimitive, reported every
++ * 5 s from Present. */
++static unsigned long long d3d9_dt_now(void)
++{
++    unsigned int lo, hi;
++    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
++    return ((unsigned long long)hi << 32) | lo;
++}
++static LONG64 d3d9_dt_step[8];
++static LONG d3d9_dt_draws;
++static const char * const d3d9_dt_names[8] =
++{
++    "checks+managed textures", "sysmem vertex buffers", "flush mapped vbs", "auto mipmaps",
++    "primitive type+apply_stateblock", "sysmem index buffer+flush ib", "draw_indexed", "rts mipmap flag",
++};
++#define D3D9_DT_STEP(n) do { unsigned long long t = d3d9_dt_now(); d3d9_dt_step[n] += t - dt_t; dt_t = t; } while (0)
++
++static void d3d9_dt_report(void)
++{
++    static LARGE_INTEGER last_qpc, freq;
++    static unsigned long long last_tsc;
++    unsigned long long tsc = d3d9_dt_now();
++    LARGE_INTEGER qpc;
++    double tick_ms;
++    unsigned int i;
++
++    QueryPerformanceCounter(&qpc);
++    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
++    if (!last_qpc.QuadPart) { last_qpc = qpc; last_tsc = tsc; return; }
++    if (qpc.QuadPart - last_qpc.QuadPart < 5 * freq.QuadPart) return;
++    tick_ms = (double)(qpc.QuadPart - last_qpc.QuadPart) * 1000.0 / freq.QuadPart / (double)(tsc - last_tsc);
++    for (i = 0; i < ARRAY_SIZE(d3d9_dt_step); ++i)
++    {
++        ERR("d3d9-draw-step: %s %.0f ms / 5 s (%ld DrawIndexedPrimitive)\n", d3d9_dt_names[i],
++                d3d9_dt_step[i] * tick_ms, d3d9_dt_draws);
++        d3d9_dt_step[i] = 0;
++    }
++    d3d9_dt_draws = 0;
++    last_qpc = qpc;
++    last_tsc = tsc;
++}
+ 
+ static void STDMETHODCALLTYPE d3d9_null_wined3d_object_destroyed(void *parent) {}
+ 
+@@ -1340,6 +1382,7 @@
+         FIXME("Ignoring dirty_region %p.\n", dirty_region);
+ 
+     wined3d_mutex_lock();
++    d3d9_dt_report();
+     for (i = 0; i < device->implicit_swapchain_count; ++i)
+     {
+         swapchain = wined3d_swapchain_get_parent(device->implicit_swapchains[i]);
+@@ -3272,6 +3315,7 @@
+         UINT vertex_count, UINT start_idx, UINT primitive_count)
+ {
+     struct d3d9_device *device = impl_from_IDirect3DDevice9Ex(iface);
++    unsigned long long dt_t;
+     unsigned int index_count;
+ 
+     TRACE("iface %p, primitive_type %#x, base_vertex_idx %u, min_vertex_idx %u, "
+@@ -3280,6 +3324,8 @@
+             vertex_count, start_idx, primitive_count);
+ 
+     wined3d_mutex_lock();
++    dt_t = d3d9_dt_now();
++    ++d3d9_dt_draws;
+     if (!device->stateblock_state->vertex_declaration)
+     {
+         wined3d_mutex_unlock();
+@@ -3294,17 +3340,25 @@
+     }
+     index_count = vertex_count_from_primitive_count(primitive_type, primitive_count);
+     d3d9_device_upload_managed_textures(device);
++    D3D9_DT_STEP(0);
+     d3d9_device_upload_sysmem_vertex_buffers(device, base_vertex_idx, min_vertex_idx, vertex_count);
++    D3D9_DT_STEP(1);
+     d3d9_device_flush_mapped_vertex_buffers(device);
++    D3D9_DT_STEP(2);
+     d3d9_generate_auto_mipmaps(device);
++    D3D9_DT_STEP(3);
+     wined3d_device_context_set_primitive_type(device->immediate_context,
+             wined3d_primitive_type_from_d3d(primitive_type), 0);
+     wined3d_device_apply_stateblock(device->wined3d_device, device->state);
++    D3D9_DT_STEP(4);
+     d3d9_device_upload_sysmem_index_buffer(device, &start_idx, index_count);
+     wined3d_device_context_flush_mapped_buffer(device->immediate_context, device->stateblock_state->index_buffer);
++    D3D9_DT_STEP(5);
+     wined3d_device_context_draw_indexed(device->immediate_context, base_vertex_idx, start_idx, index_count, 0,
+             device->stateblock_state->streams[0].frequency);
++    D3D9_DT_STEP(6);
+     d3d9_rts_flag_auto_gen_mipmap(device);
++    D3D9_DT_STEP(7);
+     wined3d_mutex_unlock();
+ 
+     return D3D_OK;

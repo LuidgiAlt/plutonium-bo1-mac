@@ -1,0 +1,60 @@
+Subject: DXVK d3d9: request geometry shaders and cull distance only if offered
+Date: 2026-10-24
+Applies to: sources/dxvk (DXVK 1.10.3 cxaddon) from crossover-sources-26.3.0.tar.gz
+Files changed: src/d3d9/d3d9_device.cpp, src/d3d9/d3d9_include.h
+
+CrossOver's DXVK requires geometryShader and shaderCullDistance for Direct3D
+9. CodeWeavers' MoltenVK 1.2.10 has geometry shaders but no cull distance
+(the menu stayed black), Khronos' MoltenVK 1.4.2 has cull distance but no
+geometry shaders (vkCreateDevice fails with VK_ERROR_FEATURE_NOT_PRESENT for
+features 5 and 39). Direct3D 9 shaders only write clip distances, and
+geometry shaders serve some meta operations, so both are requested only when
+the device offers them.
+
+d3d9_include.h: current MinGW headers define D3DDEVINFO_RESOURCEMANAGER;
+DXVK's own definition is removed. Build with -Dcpp_args='-include cstdint'
+for GCC 16 (see the build note in bo1-rosetta's README).
+
+Test on MoltenVK 1.4.2 (bo1-rosetta tools/d3d9-*-test): device created;
+shader, format, VPOS and texture matrix tests correct; the clear test is
+wrong (draws after a clear inside a frame are missing).
+---
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -3914,8 +3914,9 @@
+     DxvkDeviceFeatures supported = adapter->features();
+     DxvkDeviceFeatures enabled = {};
+ 
+-    // Geometry shaders are used for some meta ops
+-    enabled.core.features.geometryShader = VK_TRUE;
++    // Geometry shaders are used for some meta ops. MoltenVK 1.4.2 has none;
++    // request them only when the device offers them.
++    enabled.core.features.geometryShader = supported.core.features.geometryShader;
+     enabled.core.features.robustBufferAccess = VK_TRUE;
+     enabled.extRobustness2.robustBufferAccess2 = supported.extRobustness2.robustBufferAccess2;
+ 
+@@ -3944,7 +3945,9 @@
+     enabled.core.features.sampleRateShading = VK_TRUE;
+     enabled.core.features.samplerAnisotropy = supported.core.features.samplerAnisotropy;
+     enabled.core.features.shaderClipDistance = VK_TRUE;
+-    enabled.core.features.shaderCullDistance = VK_TRUE;
++    // D3D9 shaders only write clip distances; CodeWeavers' MoltenVK 1.2.10
++    // has no cull distance support.
++    enabled.core.features.shaderCullDistance = supported.core.features.shaderCullDistance;
+ 
+     // Ensure we support real BC formats and unofficial vendor ones.
+     enabled.core.features.textureCompressionBC = VK_TRUE;
+--- a/src/d3d9/d3d9_include.h
++++ b/src/d3d9/d3d9_include.h
+@@ -79,10 +79,7 @@
+ 
+ // MinGW headers are broken. Who'dve guessed?
+ #ifndef _MSC_VER
+-typedef struct _D3DDEVINFO_RESOURCEMANAGER
+-{
+-  char dummy;
+-} D3DDEVINFO_RESOURCEMANAGER, * LPD3DDEVINFO_RESOURCEMANAGER;
++/* D3DDEVINFO_RESOURCEMANAGER: defined by current MinGW headers. */
+ 
+ #ifndef __WINE__
+ extern "C" WINUSERAPI WINBOOL WINAPI SetProcessDPIAware(VOID);

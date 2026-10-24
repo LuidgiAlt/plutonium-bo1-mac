@@ -1,0 +1,33 @@
+Subject: vkd3d-shader: accept undeclared input components in shader model 1-3
+Date: 2026-10-13
+Applies to: CrossOver 26.3.0 Wine sources, after 0011
+Files changed: libs/vkd3d/libs/vkd3d-shader/ir.c
+
+Direct3D 9 shaders may read components of an input register that its dcl does
+not include. The I/O normaliser looked the register up by component and
+failed ("Unable to resolve I/O register to a signature element"); for shader
+model 1-3 it now falls back to the register alone. The error message names
+the register.
+
+License: LGPL-2.1-or-later, like the Wine files it modifies.
+---
+--- a/libs/vkd3d/libs/vkd3d-shader/ir.c
++++ b/libs/vkd3d/libs/vkd3d-shader/ir.c
+@@ -4242,10 +4242,15 @@
+ 
+     id_idx = reg->idx_count - 1;
+     write_mask = VKD3DSP_WRITEMASK_0 << vsir_swizzle_get_component(src_param->swizzle, 0);
+-    if (!shader_signature_find_element_for_reg(signature, reg_idx, write_mask, &element_idx))
++    /* Shader model 1-3 shaders may read components of an input that its
++     * declaration does not include; match on the register alone then. */
++    if (!shader_signature_find_element_for_reg(signature, reg_idx, write_mask, &element_idx)
++            && (normaliser->major >= 4 || !shader_signature_find_element_for_reg(signature, reg_idx, 0, &element_idx)))
+     {
+         vkd3d_shader_error(normaliser->message_context, &ins->location, VKD3D_SHADER_ERROR_VSIR_INVALID_SIGNATURE,
+-                "Unable to resolve I/O register to a signature element.");
++                "Unable to resolve I/O register to a signature element (type %#x, register %u, mask %#x, "
++                "shader type %#x, version %u, opcode %#x).", reg->type, reg_idx, write_mask,
++                normaliser->shader_type, normaliser->major, ins->opcode);
+         normaliser->result = VKD3D_ERROR_INVALID_SHADER;
+         return;
+     }
