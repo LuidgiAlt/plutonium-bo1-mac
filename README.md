@@ -1,3 +1,5 @@
+# See https://github.com/LuidgiAlt/plutonium-mac-aio, enjoy !
+
 # Plutonium Black Ops 1 on Apple Silicon (work in progress)
 
 Patches and scripts to run Call of Duty: Black Ops (Steam, app 42700) through
